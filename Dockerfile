@@ -1,6 +1,6 @@
 FROM python:3.12-slim-bookworm
 
-# LibreOffice Calc（headless 重算）+ 字体 + curl（健康检查）
+# LibreOffice Calc（headless 重算）+ 字体 + curl（健康检查）+ procps（进程核查）
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         libreoffice-calc \
@@ -8,6 +8,7 @@ RUN apt-get update \
         fonts-dejavu-core \
         curl \
         ca-certificates \
+        procps \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

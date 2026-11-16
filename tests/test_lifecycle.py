@@ -160,8 +160,9 @@ def test_staging_cleaned_after_completion(client, make_workbook, tmp_data_dir):
     assert len(record["samples"]) == 2
 
 
-def test_restart_marks_interrupted(tmp_path, monkeypatch):
-    """模拟重启：构造一个 QUEUED 持久化记录，新管理器恢复时应为 interrupted。"""
+@pytest.mark.asyncio
+async def test_restart_marks_interrupted(tmp_path, monkeypatch):
+    """模拟重启：非终态持久化记录先置 recovering，异步回收后落 interrupted。"""
     data_dir = tmp_path / "data"
     (data_dir / "tasks").mkdir(parents=True)
     (data_dir / "staging").mkdir(parents=True)
@@ -193,13 +194,21 @@ def test_restart_marks_interrupted(tmp_path, monkeypatch):
 
     from app.manager import TaskManager
     mgr = TaskManager()
-    mgr.recover_on_startup()
+    pending = mgr.recover_on_startup()
 
+    # 恢复第一阶段：状态可查为 recovering，名额仍被遗留批次占用
+    assert pending == [stale_id]
+    assert mgr._tasks[stale_id]["status"] == "recovering"
+    assert mgr.slots.in_use == 1
+
+    # 回收完成：落 interrupted、暂存清理、名额归还
+    mgr.start_reclamation()
+    await asyncio.gather(*mgr._reclaim_jobs.values())
     recovered = mgr._tasks[stale_id]
     assert recovered["status"] == "interrupted"
     assert recovered["error_code"] == "INTERRUPTED_BY_RESTART"
-    # 暂存被清理
     assert not (data_dir / "staging" / stale_id).exists()
+    assert mgr.slots.in_use == 0
 
     # 已完成的任务重启后状态保持不变
     done_id = "done5678"
@@ -271,7 +280,7 @@ async def test_running_cancel_kills_recalc(monkeypatch, tmp_path):
     buf = io.BytesIO()
     wb.save(buf)
 
-    async def fake_recalc(task_dir, cancel_event=None):
+    async def fake_recalc(task_dir, cancel_event=None, on_process_start=None):
         # 模拟重算进行中：先 sleep 再检查取消，保证取消有机会在返回前到达
         for _ in range(100):
             await asyncio.sleep(0.05)

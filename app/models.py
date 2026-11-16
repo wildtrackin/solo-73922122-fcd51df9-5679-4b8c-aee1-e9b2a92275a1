@@ -16,7 +16,8 @@ class TaskStatus(str, Enum):
     COMPLETED   正常完成，结果已发布
     FAILED      整批失败（公式错误/重算失败/超时），不发布逐样本结果
     CANCELLED   已取消，不发布结果
-    INTERRUPTED 服务重启时发现该批未走完终态
+    RECOVERING  服务重启后正在回收该批残留计算进程与暂存（非终态，可查）
+    INTERRUPTED 残留进程已确认退出、暂存已清理，该批未走完终态
     """
 
     QUEUED = "queued"
@@ -24,6 +25,7 @@ class TaskStatus(str, Enum):
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
+    RECOVERING = "recovering"
     INTERRUPTED = "interrupted"
 
 
@@ -35,10 +37,11 @@ TERMINAL_STATUSES = {
     TaskStatus.INTERRUPTED,
 }
 
-# 不发布逐样本结果的终态
+# 不发布逐样本结果的状态/终态
 NO_RESULT_STATUSES = {
     TaskStatus.FAILED,
     TaskStatus.CANCELLED,
+    TaskStatus.RECOVERING,
     TaskStatus.INTERRUPTED,
 }
 

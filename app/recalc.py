@@ -78,11 +78,14 @@ async def run_recalc(
     task_dir: Path,
     input_name: str = "input.xlsx",
     cancel_event: asyncio.Event | None = None,
+    on_process_start=None,
 ) -> Path:
     """执行一次 headless 转换重算。
 
     task_dir 下需已有 input.xlsx；输出到 task_dir/output/input.xlsx。
     超时或取消时杀掉整个进程组并抛出对应异常。
+    on_process_start：可选异步回调，子进程启动后以 PID 调用，
+    供编排层把计算进程身份持久化（异常退出后的重启回收要用）。
     """
     input_path = task_dir / input_name
     output_dir = task_dir / "output"
@@ -114,6 +117,9 @@ async def run_recalc(
         stderr=asyncio.subprocess.PIPE,
         start_new_session=True,  # 独立进程组，便于整组 kill
     )
+    if on_process_start is not None:
+        # 先回报 PID 再进入监视：即使此刻服务被杀，重启后也能按记录找到它
+        await on_process_start(process.pid)
 
     deadline = asyncio.get_running_loop().time() + config.RECALC_TIMEOUT_SECONDS
 
@@ -237,6 +243,156 @@ def _kill_process_group(process: asyncio.subprocess.Process) -> None:
             process.kill()
         except (ProcessLookupError, PermissionError):
             pass
+
+
+# ---------- 异常退出后的遗留进程回收（重启恢复用） ----------
+#
+# 身份识别：每批重算进程的命令行都带有该批独有的暂存路径
+# （-env:UserInstallation=file://<staging>/<task_id>/lo-profile、
+#   --outdir <staging>/<task_id>/output、输入文件路径）。
+# task_id 是 32 位十六进制随机串，其它批次、同机无关进程（包括用户自己
+# 开的 soffice）的命令行不可能包含该路径，因此按此标记匹配不会误杀。
+# 记录的 recalc_pid 仅作为线索，杀前必须用同一标记复核，防止 PID 被
+# 系统复用后误杀无关进程。
+
+
+def _proc_root() -> Path | None:
+    root = Path("/proc")
+    return root if root.is_dir() else None
+
+
+def _task_marker(task_id: str) -> bytes:
+    """该批重算进程命令行中必然出现的独有字节串。"""
+    return str((config.STAGING_DIR / task_id).resolve()).encode()
+
+
+def find_task_processes(task_id: str) -> list[int]:
+    """扫描 /proc，返回命令行引用该批暂存路径的存活进程 PID。
+
+    僵尸进程 cmdline 为空，天然被排除；非 Linux（无 /proc）退化为空表。
+    """
+    root = _proc_root()
+    if root is None:
+        return []
+    marker = _task_marker(task_id)
+    hits: list[int] = []
+    for entry in root.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            cmdline = (entry / "cmdline").read_bytes()
+        except OSError:
+            continue
+        if marker in cmdline:
+            hits.append(int(entry.name))
+    return hits
+
+
+def pid_belongs_to_task(pid: int, task_id: str) -> bool:
+    """复核某个 PID 当前确属该批的计算进程（防 PID 复用误杀）。"""
+    root = _proc_root()
+    if root is None:
+        return False
+    try:
+        cmdline = (root / str(pid) / "cmdline").read_bytes()
+    except OSError:
+        return False
+    return _task_marker(task_id) in cmdline
+
+
+def _pid_alive(pid: int) -> bool:
+    """进程存在且非僵尸。/proc 不可读时按已退出处理（回收继续推进）。"""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+    except OSError:
+        return False
+    try:
+        # comm 字段可含空格与括号，状态是最后一个 ')' 之后的第一列
+        state = stat.rsplit(")", 1)[1].split()[0]
+    except IndexError:
+        return False
+    return state != "Z"
+
+
+async def _wait_all_exit(pids, timeout: float) -> list[int]:
+    """轮询等待全部 PID 退出，返回超时后仍存活的列表。"""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    remaining = [p for p in set(pids) if _pid_alive(p)]
+    while remaining and loop.time() < deadline:
+        await asyncio.sleep(config.POLL_INTERVAL_SECONDS)
+        remaining = [p for p in remaining if _pid_alive(p)]
+    return remaining
+
+
+def _signal_targets(pids, sig: int) -> None:
+    """按进程组发信号（一组信号即可覆盖 fork 出的全部子孙）。
+
+    取不到进程组时退化为单进程信号。绝不向 0/1/自身所在进程组发信号，
+    避免误伤服务自身或系统进程。
+    """
+    own_pgid = os.getpgrp()
+    for pid in pids:
+        pgid: int | None
+        try:
+            pgid = os.getpgid(pid)
+        except (ProcessLookupError, PermissionError, OSError):
+            pgid = None
+        if pgid is not None and pgid not in (0, 1, own_pgid):
+            try:
+                os.killpg(pgid, sig)
+                continue
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+        try:
+            os.kill(pid, sig)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+
+
+async def _collect_targets(task_id: str, extra_pids) -> list[int]:
+    """汇总回收目标：/proc 扫描命中 + 复核通过的记录 PID。"""
+    pids = set(find_task_processes(task_id))
+    for pid in extra_pids:
+        if pid and _pid_alive(pid) and pid_belongs_to_task(pid, task_id):
+            pids.add(pid)
+    return sorted(pids)
+
+
+async def reap_task_processes(
+    task_id: str,
+    known_pids=(),
+    term_grace: float | None = None,
+    kill_timeout: float | None = None,
+) -> list[int]:
+    """终止某批次遗留的计算进程（含子进程）并等待退出。
+
+    只匹配命令行含该批独有暂存路径的进程，不会误停同机无关进程或
+    其它批次。先 SIGTERM 宽限，再 SIGKILL；返回最终仍存活的 PID
+    （正常为空，调用方可据此决定是否重试）。
+    """
+    if term_grace is None:
+        term_grace = config.RECOVERY_TERM_GRACE_SECONDS
+    if kill_timeout is None:
+        kill_timeout = config.RECOVERY_KILL_TIMEOUT_SECONDS
+
+    targets = await _collect_targets(task_id, known_pids)
+    if not targets:
+        return []
+    _signal_targets(targets, signal.SIGTERM)
+    remaining = await _wait_all_exit(targets, term_grace)
+    if remaining:
+        # 宽限内未退出：重新扫描（含其间 fork 的新子进程），升级 SIGKILL
+        targets = await _collect_targets(task_id, remaining)
+        _signal_targets(targets, signal.SIGKILL)
+        remaining = await _wait_all_exit(targets, kill_timeout)
+    if not remaining:
+        # 兜底复核：扫描与信号之间可能 fork 出的新进程
+        remaining = await _collect_targets(task_id, [])
+        if remaining:
+            _signal_targets(remaining, signal.SIGKILL)
+            remaining = await _wait_all_exit(remaining, kill_timeout)
+    return remaining
 
 
 async def _drain_stream(stream) -> str:

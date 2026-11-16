@@ -27,6 +27,27 @@ RECALC_TIMEOUT_SECONDS = _env_int("RECALC_TIMEOUT_SECONDS", 10)
 # 轮询子进程的间隔
 POLL_INTERVAL_SECONDS = float(os.environ.get("POLL_INTERVAL_SECONDS", "0.2"))
 
+# 重启回收（旧批残留计算进程的收尾）：
+# SIGTERM 宽限（秒），逾期升级为 SIGKILL
+RECOVERY_TERM_GRACE_SECONDS = float(
+    os.environ.get("RECOVERY_TERM_GRACE_SECONDS", "1.5")
+)
+# SIGKILL 后等待进程退出的上限（秒）
+RECOVERY_KILL_TIMEOUT_SECONDS = float(
+    os.environ.get("RECOVERY_KILL_TIMEOUT_SECONDS", "5")
+)
+# 清理暂存后复核（进程未复活、目录未重建）前的短暂延迟（秒）
+RECOVERY_VERIFY_DELAY_SECONDS = float(
+    os.environ.get("RECOVERY_VERIFY_DELAY_SECONDS", "0.3")
+)
+# 回收轮数上限（防御性兜底；正常一轮即完成）
+RECOVERY_MAX_ROUNDS = _env_int("RECOVERY_MAX_ROUNDS", 3)
+# 快速轮仍未确认进程退出时，慢速重试的间隔（秒）：
+# 期间批次保持 recovering、名额不释放，确认退出前绝不落 interrupted
+RECOVERY_SLOW_RETRY_INTERVAL_SECONDS = float(
+    os.environ.get("RECOVERY_SLOW_RETRY_INTERVAL_SECONDS", "5")
+)
+
 # 样本表名称与关键列
 SAMPLE_SHEET_NAME = os.environ.get("SAMPLE_SHEET_NAME", "样本表")
 SAMPLE_ID_COLUMN = 1  # A 列：唯一样本号

@@ -3,6 +3,8 @@ services:
     build: .
     image: lab-verdict-verify:1.0.0
     container_name: lab-verdict-verify
+    # tini 作为 PID 1：回收工作进程异常退出后留下的孤儿计算进程僵尸
+    init: true
     ports:
       - "8000:8000"
     environment:

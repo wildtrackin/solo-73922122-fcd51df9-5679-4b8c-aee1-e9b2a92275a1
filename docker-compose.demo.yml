@@ -1,0 +1,17 @@
+# 演示「工作进程异常退出 → 重启回收」的 compose 覆盖文件。
+#
+# 生产形态下 uvicorn 是容器 PID 1，容器重启会带走全部进程；
+# 为在单容器内复现「同机原数据目录重启、孤儿计算进程仍在运行」，
+# 本覆盖用监督循环跑 uvicorn：工作进程被杀后容器仍然存活
+# （孤儿 soffice 过继给 tini），1 秒后工作进程以原 /data 重启。
+#
+# 用法：docker compose -f docker-compose.yml -f docker-compose.demo.yml up -d --build
+services:
+  verify-api:
+    command: >-
+      bash -c 'while true; do
+        echo "[demo] 启动 API 工作进程";
+        uvicorn app.main:app --host 0.0.0.0 --port 8000;
+        echo "[demo] 工作进程已退出（退出码 $?），1 秒后重启";
+        sleep 1;
+      done'

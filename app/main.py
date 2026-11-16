@@ -25,8 +25,11 @@ async def lifespan(app: FastAPI):
     config.DATA_DIR.mkdir(parents=True, exist_ok=True)
     config.STAGING_DIR.mkdir(parents=True, exist_ok=True)
     config.TASKS_DIR.mkdir(parents=True, exist_ok=True)
-    # 重启恢复：未走完终态的批次标记为中断
+    # 重启恢复：未走完终态的批次置 recovering 并占住名额，
+    # 后台回收确认残留进程退出、暂存清理后才落 interrupted 并归还名额；
+    # 回收期间服务正常受理查询与新任务（新批只能使用已释放的名额）
     manager.recover_on_startup()
+    manager.start_reclamation()
     yield
 
 
@@ -142,11 +145,15 @@ async def cancel_task(task_id: str):
                     "message": f"任务不存在：{task_id}"},
         )
     if not accepted:
+        if record["status"] == TaskStatus.RECOVERING.value:
+            message = "服务恢复中：该批次正在回收，随后标记为中断，无需取消"
+        else:
+            message = f"任务已处于终态 {record['status']}，不可取消"
         return CancelResponse(
             task_id=task_id,
             status=TaskStatus(record["status"]),
             cancel_requested=True,
-            message=f"任务已处于终态 {record['status']}，不可取消",
+            message=message,
         )
     return CancelResponse(
         task_id=task_id,
