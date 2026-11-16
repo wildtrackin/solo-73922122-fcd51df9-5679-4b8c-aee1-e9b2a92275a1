@@ -1,0 +1,26 @@
+services:
+  verify-api:
+    build: .
+    image: lab-verdict-verify:1.0.0
+    container_name: lab-verdict-verify
+    ports:
+      - "8000:8000"
+    environment:
+      # 单批重算超时 10 秒；最多两批并行；上传上限 2 MiB
+      RECALC_TIMEOUT_SECONDS: "10"
+      MAX_CONCURRENT_BATCHES: "2"
+      MAX_UPLOAD_BYTES: "2097152"
+      MAX_SAMPLE_ROWS: "100"
+      DATA_DIR: "/data"
+    volumes:
+      - verdict-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  verdict-data:
